@@ -1,5 +1,3 @@
-'use strict';
-
 const debug = require('ghost-ignition').debug('importer:posts'),
     _ = require('lodash'),
     uuid = require('uuid'),
@@ -74,6 +72,12 @@ class PostsImporter extends BaseImporter {
      * Replace all identifier references.
      */
     replaceIdentifiers() {
+        const ownerUserId = _.find(this.requiredExistingData.users, (user) => {
+            if (user.roles[0].name === 'Owner') {
+                return true;
+            }
+        }).id;
+
         const run = (postToImport, postIndex, targetProperty, tableName) => {
             if (!postToImport[targetProperty] || !postToImport[targetProperty].length) {
                 return;
@@ -81,6 +85,7 @@ class PostsImporter extends BaseImporter {
 
             let indexesToRemove = [];
             _.each(postToImport[targetProperty], (object, index) => {
+                // this is the original relational object (old id)
                 let objectInFile = _.find(this.requiredFromFile[tableName], {id: object.id});
 
                 if (!objectInFile) {
@@ -96,15 +101,16 @@ class PostsImporter extends BaseImporter {
                     }
                 }
 
-                // CASE: search through imported data
-                let importedObject = _.find(this.requiredImportedData[tableName], {slug: objectInFile.slug});
+                // CASE: search through imported data.
+                // EDGE CASE: uppercase tag slug was imported and auto modified
+                let importedObject = _.find(this.requiredImportedData[tableName], {originalSlug: objectInFile.slug});
 
                 if (importedObject) {
                     this.dataToImport[postIndex][targetProperty][index].id = importedObject.id;
                     return;
                 }
 
-                // CASE: search through existing data
+                // CASE: search through existing data by unique attribute
                 let existingObject = _.find(this.requiredExistingData[tableName], {slug: objectInFile.slug});
 
                 if (existingObject) {
@@ -117,6 +123,17 @@ class PostsImporter extends BaseImporter {
             this.dataToImport[postIndex][targetProperty] = _.filter(this.dataToImport[postIndex][targetProperty], ((object, index) => {
                 return indexesToRemove.indexOf(index) === -1;
             }));
+
+            // CASE: we had to remove all the relations, because we could not match or find the relation reference.
+            // e.g. you import a post with multiple authors. Only the primary author is assigned.
+            // But the primary author won't be imported and we can't find the author in the existing database.
+            // This would end in `post.authors = []`, which is not allowed. There must be always minimum one author.
+            // We fallback to the owner user.
+            if (targetProperty === 'authors' && !this.dataToImport[postIndex][targetProperty].length) {
+                this.dataToImport[postIndex][targetProperty] = [{
+                    id: ownerUserId
+                }];
+            }
         };
 
         _.each(this.dataToImport, (postToImport, postIndex) => {

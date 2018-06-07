@@ -1,4 +1,4 @@
-'use strict';
+/* eslint-disable */
 
 const mockKnex = require('mock-knex'),
     _ = require('lodash'),
@@ -7,10 +7,10 @@ const mockKnex = require('mock-knex'),
     knex = require('../../../server/data/db').knex;
 
 /**
- * Knex mock. The database is our Datagenerator.
+ * Knex mock. The database values are taken from our Datagenerator.
  * You can either self register queries or you simply rely on the data generator data.
  *
- * Please extend if you use-case does not work.
+ * Please extend if your use-case does not work.
  *
  * @TODO: sqlite3 :memory: mode wasn't working for me
  */
@@ -18,7 +18,16 @@ class KnexMock {
     initialiseDb() {
         this.db = {};
 
-        _.each(_.pick(_.cloneDeep(DataGenerator.forKnex), ['posts', 'users', 'tags', 'permissions', 'roles', 'posts_authors']), (objects, tableName) => {
+        _.each(_.pick(_.cloneDeep(DataGenerator.forKnex), [
+            'posts',
+            'users',
+            'tags',
+            'invites',
+            'permissions',
+            'roles',
+            'posts_authors',
+            'posts_tags'
+        ]), (objects, tableName) => {
             this.db[tableName] = [];
 
             _.each(objects, (object) => {
@@ -62,14 +71,20 @@ class KnexMock {
                                 joinAttribute = query.sql.match(/on\s\"\w+\"\.\"\w+\"\s\=\s\"\w+\"\.(\"\w+\")/)[1],
                                 joinTable = query.sql.match(/on\s\"\w+\"\.\"\w+\"\s\=\s(\"\w+\")/)[1],
                                 targetIdentifier = query.sql.match(/(\"\w+\")\sin\s\(\?\)/),
-                                value = query.bindings[0],
+                                values = query.bindings,
                                 targetEntries,
                                 toReturn = [];
 
+                            if (!targetIdentifier) {
+                                targetIdentifier = query.sql.match(/where\s\"\w+\"\.\"(\w+)\"\s\=/);
+                            }
+
+                            if (!targetIdentifier) {
+                                targetIdentifier = query.sql.match(/where\s\"\w+\"\.\"(\w+)\"\s\in\s/);
+                            }
+
                             if (targetIdentifier) {
                                 targetIdentifier = targetIdentifier[1];
-                            } else {
-                                targetIdentifier = query.sql.match(/where\s\"\w+\"\.\"(\w+)\"\s\=/)[1];
                             }
 
                             targetTable = targetTable.replace(/"/g, '');
@@ -81,29 +96,39 @@ class KnexMock {
                             debug(targetTable, targetIdentifier, targetAttribute, joinTable, joinAttribute);
 
                             targetEntries = _.filter(this.db[targetTable], ((existing) => {
-                                if (existing[targetIdentifier] === value) {
+                                if (values.indexOf(existing[targetIdentifier]) !== -1) {
                                     return true;
                                 }
                             }));
 
                             if (targetEntries && targetEntries.length) {
                                 _.each(targetEntries, ((target) => {
-                                    const found = _.find(this.db[joinTable], ((joinEntry) => {
+                                    let found = _.cloneDeep(_.find(this.db[joinTable], ((joinEntry) => {
                                         if (joinEntry[joinAttribute] === target[targetAttribute]) {
                                             return true;
                                         }
-                                    }));
+                                    })));
 
                                     _.each(target, function (value, key) {
                                         let match = query.sql.match(new RegExp('\\"' + targetTable + '\\"\\.\\"' + key + '"\\sas\\s(\\"\\w+\\")'));
 
-                                        // CASE: e.g. id
+                                        // CASE: "posts_tags"."post_id" as "post_id"
                                         if (match) {
                                             match = match[1];
                                             match = match.replace(/"/g, '');
                                             found[match] = value;
                                         }
                                     });
+
+                                    let keys = query.sql.match(/select\s(\".*\"\,?)+\sfrom/)[1];
+
+                                    if (!keys.match(/\.*/)) {
+                                        _.each(found, (value, key)=> {
+                                            if (keys.indexOf(key) === -1) {
+                                                delete found[key];
+                                            }
+                                        });
+                                    }
 
                                     if (found) {
                                         toReturn.push(found);
@@ -121,25 +146,74 @@ class KnexMock {
                         } else {
                             let tableName = query.sql.match(/from\s\"(\w+)\"/)[1],
                                 where = query.sql.match(/\"(\w+)\"\s\=\s\?/),
-                                value = query.bindings[0],
-                                dbEntry;
+                                values = query.bindings,
+                                dbEntry,
+                                wheres = [];
 
                             // where "users"."id" in ('1')
                             if (!where) {
                                 where = query.sql.match(/\"\w+\"\.\"(\w+)\"\sin\s\(\?\)/)[1];
                             } else {
-                                where = where[1];
+                                let wheresMatch = query.sql.match(/\(?\"(\w+)\"\.?\"?(\w+)?\"?\s=\s\?\)?/g);
+
+                                // e.g. [ '("posts"."status" = ?)', '("posts"."page" = ?)' ]
+                                // e.g. [ '"status" = ?' ]
+                                _.each(wheresMatch, (result)=> {
+                                    let attr = result.match(/\(?\"(\w+)\"\.?\"?(\w+)?\"?\s=\s\?\)?/);
+                                    wheres.push(attr[2] || attr[1]);
+                                });
                             }
 
-                            debug(tableName, where, value);
+                            values = query.bindings.slice(0, wheres.length);
+
+                            debug(tableName, wheres, values);
 
                             dbEntry = _.filter(this.db[tableName], ((existing) => {
-                                if (existing[where] === value) {
+                                if (_.isEqual(_.values(_.pick(existing, wheres)), values)) {
                                     return true;
                                 }
                             }));
 
                             if (dbEntry) {
+                                // select fields
+                                dbEntry = _.map(dbEntry, (obj) => {
+                                    let keys = query.sql.match(/select\s(\".*\"\,?)+\sfrom/);
+
+                                    if (keys) {
+                                        keys = keys[1];
+                                        keys = keys.replace(/"/g, '');
+                                        keys = keys.replace(/\s/g, '');
+                                        keys = keys.split(',');
+                                        return _.pick(obj, keys);
+                                    }
+
+                                    return obj;
+                                });
+
+                                if (query.sql.match(/count\(/)) {
+                                    const as = query.sql.match(/count\(.*\)\sas\s(\w+)/)[1];
+                                    return query.response([{[as]: dbEntry.length}]);
+                                }
+
+                                if (query.sql.match(/limit\s\?\soffset\s\?/)) {
+                                    const limit = query.bindings[query.bindings.length - 2];
+                                    const offset = query.bindings[query.bindings.length - 1];
+
+                                    function separateIt(arr, size) {
+                                        const newArr = [];
+                                        for (let i = 0; i < arr.length; i += size) {
+                                            let sliceIt = arr.slice(i, i + size);
+                                            newArr.push(sliceIt);
+                                        }
+                                        return newArr;
+                                    }
+
+                                    dbEntry = separateIt(dbEntry, limit)[offset - 1];
+                                } else if (query.sql.match(/limit\s\?$/)) {
+                                    const limit = query.bindings[query.bindings.length - 1];
+                                    dbEntry = dbEntry.splice(0, limit);
+                                }
+
                                 query.response(dbEntry);
                                 debug('#### Query end.\n');
                             } else {

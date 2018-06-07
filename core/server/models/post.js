@@ -1,5 +1,3 @@
-'use strict';
-
 // # Post Model
 var _ = require('lodash'),
     uuid = require('uuid'),
@@ -11,6 +9,7 @@ var _ = require('lodash'),
     htmlToText = require('html-to-text'),
     ghostBookshelf = require('./base'),
     config = require('../config'),
+    labs = require('../services/labs'),
     converters = require('../lib/mobiledoc/converters'),
     urlService = require('../services/url'),
     relations = require('./relations'),
@@ -39,6 +38,12 @@ Post = ghostBookshelf.Model.extend({
 
     relationships: ['tags', 'authors'],
 
+    // NOTE: look up object, not super nice, but was easy to implement
+    relationshipBelongsTo: {
+        tags: 'tags',
+        authors: 'users'
+    },
+
     /**
      * The base model keeps only the columns, which are defined in the schema.
      * We have to add the relations on top, otherwise bookshelf-relations
@@ -55,15 +60,19 @@ Post = ghostBookshelf.Model.extend({
     },
 
     emitChange: function emitChange(event, options) {
-        options = options || {};
+        let eventToTrigger;
 
         var resourceType = this.get('page') ? 'page' : 'post';
 
-        if (options.usePreviousResourceType) {
+        if (options.useUpdatedAttribute) {
             resourceType = this.updated('page') ? 'page' : 'post';
+        } else if (options.usePreviousAttribute) {
+            resourceType = this.previous('page') ? 'page' : 'post';
         }
 
-        common.events.emit(resourceType + '.' + event, this, options);
+        eventToTrigger = resourceType + '.' + event;
+
+        ghostBookshelf.Model.prototype.emitChange.bind(this)(this, eventToTrigger, options);
     },
 
     /**
@@ -82,14 +91,14 @@ Post = ghostBookshelf.Model.extend({
 
         var status = model.get('status');
 
-        model.emitChange('added');
+        model.emitChange('added', options);
 
         if (['published', 'scheduled'].indexOf(status) !== -1) {
-            model.emitChange(status, {importing: options.importing});
+            model.emitChange(status, options);
         }
     },
 
-    onUpdated: function onUpdated(model) {
+    onUpdated: function onUpdated(model, attrs, options) {
         model.statusChanging = model.get('status') !== model.updated('status');
         model.isPublished = model.get('status') === 'published';
         model.isScheduled = model.get('status') === 'scheduled';
@@ -102,65 +111,65 @@ Post = ghostBookshelf.Model.extend({
         // Handle added and deleted for post -> page or page -> post
         if (model.resourceTypeChanging) {
             if (model.wasPublished) {
-                model.emitChange('unpublished', {usePreviousResourceType: true});
+                model.emitChange('unpublished', Object.assign({useUpdatedAttribute: true}, options));
             }
 
             if (model.wasScheduled) {
-                model.emitChange('unscheduled', {usePreviousResourceType: true});
+                model.emitChange('unscheduled', Object.assign({useUpdatedAttribute: true}, options));
             }
 
-            model.emitChange('deleted', {usePreviousResourceType: true});
-            model.emitChange('added');
+            model.emitChange('deleted', Object.assign({useUpdatedAttribute: true}, options));
+            model.emitChange('added', options);
 
             if (model.isPublished) {
-                model.emitChange('published');
+                model.emitChange('published', options);
             }
 
             if (model.isScheduled) {
-                model.emitChange('scheduled');
+                model.emitChange('scheduled', options);
             }
         } else {
             if (model.statusChanging) {
                 // CASE: was published before and is now e.q. draft or scheduled
                 if (model.wasPublished) {
-                    model.emitChange('unpublished');
+                    model.emitChange('unpublished', options);
                 }
 
                 // CASE: was draft or scheduled before and is now e.q. published
                 if (model.isPublished) {
-                    model.emitChange('published');
+                    model.emitChange('published', options);
                 }
 
                 // CASE: was draft or published before and is now e.q. scheduled
                 if (model.isScheduled) {
-                    model.emitChange('scheduled');
+                    model.emitChange('scheduled', options);
                 }
 
                 // CASE: from scheduled to something
                 if (model.wasScheduled && !model.isScheduled && !model.isPublished) {
-                    model.emitChange('unscheduled');
+                    model.emitChange('unscheduled', options);
                 }
             } else {
                 if (model.isPublished) {
-                    model.emitChange('published.edited');
+                    model.emitChange('published.edited', options);
                 }
 
                 if (model.needsReschedule) {
-                    model.emitChange('rescheduled');
+                    model.emitChange('rescheduled', options);
                 }
             }
 
             // Fire edited if this wasn't a change between resourceType
-            model.emitChange('edited');
+            model.emitChange('edited', options);
         }
     },
 
-    onDestroying: function onDestroying(model) {
+    onDestroyed: function onDestroyed(model, options) {
         if (model.previous('status') === 'published') {
-            model.emitChange('unpublished');
+            model.emitChange('unpublished', Object.assign({usePreviousAttribute: true}, options));
         }
 
-        model.emitChange('deleted');
+        model.emitChange('deleted', Object.assign({usePreviousAttribute: true}, options));
     },
 
     onSaving: function onSaving(model, attr, options) {
@@ -173,11 +182,12 @@ Post = ghostBookshelf.Model.extend({
             newTitle = this.get('title'),
             newStatus = this.get('status'),
             olderStatus = this.previous('status'),
-            prevTitle = this._previousAttributes.title,
-            prevSlug = this._previousAttributes.slug,
+            prevTitle = this.previous('title'),
+            prevSlug = this.previous('slug'),
             publishedAt = this.get('published_at'),
             publishedAtHasChanged = this.hasDateChanged('published_at', {beforeWrite: true}),
-            mobiledoc = this.get('mobiledoc'),
+            mobiledoc = JSON.parse(this.get('mobiledoc') || null),
+            generatedFields = ['html', 'plaintext'],
             tagsToSave,
             ops = [];
 
@@ -233,8 +243,43 @@ Post = ghostBookshelf.Model.extend({
 
         ghostBookshelf.Model.prototype.onSaving.call(this, model, attr, options);
 
+        // do not allow generated fields to be overridden via the API
+        generatedFields.forEach((field) => {
+            if (this.hasChanged(field)) {
+                this.set(field, this.previous(field));
+            }
+        });
+
+        // render mobiledoc to HTML. Switch render version if Koenig is enabled
+        // or has been edited with Koenig and is no longer compatible with the
+        // Ghost 1.0 markdown-only renderer
+        // TODO: re-render all content and remove the version toggle for Ghost 2.0
         if (mobiledoc) {
-            this.set('html', converters.mobiledocConverter.render(JSON.parse(mobiledoc)));
+            let version = 1;
+            let koenigEnabled = labs.isSet('koenigEditor') === true;
+
+            let mobiledocIsCompatibleWithV1 = function mobiledocIsCompatibleWithV1(doc) {
+                if (doc
+                    && doc.markups.length === 0
+                    && doc.cards.length === 1
+                    && doc.cards[0][0].match(/(?:card-)?markdown/)
+                    && doc.sections.length === 1
+                    && doc.sections[0].length === 2
+                    && doc.sections[0][0] === 10
+                    && doc.sections[0][1] === 0
+                ) {
+                    return true;
+                }
+
+                return false;
+            };
+
+            if (koenigEnabled || !mobiledocIsCompatibleWithV1(mobiledoc)) {
+                version = 2;
+            }
+
+            let html = converters.mobiledocConverter.render(mobiledoc, version);
+            this.set('html', html);
         }
 
         if (this.hasChanged('html') || !this.get('plaintext')) {
@@ -345,7 +390,35 @@ Post = ghostBookshelf.Model.extend({
     fields: function fields() {
         return this.morphMany('AppField', 'relatable');
     },
-
+    /**
+     * @NOTE:
+     * If you are requesting models with `columns`, you try to only receive some fields of the model/s.
+     * But the model layer is complex and needs specific fields in specific situations.
+     *
+     * ### url generation
+     *   - @TODO: with dynamic routing, we no longer need default columns to fetch
+     *   - because with static routing Ghost generated the url on runtime and needed the following attributes:
+     *     - `slug`: /:slug/
+     *     - `published_at`: /:year/:slug
+     *     - `author_id`: /:author/:slug, /:primary_author/:slug
+     *     - now, the UrlService pre-generates urls based on the resources
+     *     - you can ask `urlService.getUrlByResourceId(post.id)`
+     *
+     * ### events
+     *   - you call `findAll` with `columns: id`
+     *   - then you trigger `post.save()` on the response
+     *   - bookshelf events (`onSaving`) and model events (`emitChange`) are triggered
+     *   - but you only fetched the id column, this will trouble (!), because the event hooks require more
+     *     data than just the id
+     *   - @TODO: we need to disallow this (!)
+     *   - you should use `models.Post.edit(..)`
+     *      - this disallows using the `columns` option
+     *   - same for destroy - you should use `models.Post.destroy(...)`
+     *
+     * @IMPORTANT: This fn should **never** be used when updating models (models.Post.edit)!
+     *            Because the events for updating a resource require most of the fields.
+     *            This is protected by the fn `permittedOptions`.
+     */
     defaultColumnsToFetch: function defaultColumnsToFetch() {
         return ['id', 'published_at', 'slug', 'author_id'];
     },
@@ -386,7 +459,7 @@ Post = ghostBookshelf.Model.extend({
         }
 
         if (!options.columns || (options.columns && options.columns.indexOf('url') > -1)) {
-            attrs.url = urlService.utils.urlPathForPost(attrs);
+            attrs.url = urlService.getUrlByResourceId(attrs.id);
         }
 
         if (oldPostId) {
@@ -497,7 +570,8 @@ Post = ghostBookshelf.Model.extend({
             validOptions = {
                 findOne: ['columns', 'importing', 'withRelated', 'require'],
                 findPage: ['page', 'limit', 'columns', 'filter', 'order', 'status', 'staticPages'],
-                findAll: ['columns', 'filter']
+                findAll: ['columns', 'filter'],
+                destroy: ['destroyAll']
             };
 
         // The post model additionally supports having a formats option
@@ -505,6 +579,20 @@ Post = ghostBookshelf.Model.extend({
 
         if (validOptions[methodName]) {
             options = options.concat(validOptions[methodName]);
+        }
+
+        return options;
+    },
+
+    /**
+     * We have to ensure consistency. If you listen on model events (e.g. `post.published`), you can expect that you always
+     * receive all fields including relations. Otherwise you can't rely on a consistent flow. And we want to avoid
+     * that event listeners have to re-fetch a resource. This function is used in the context of inserting
+     * and updating resources. We won't return the relations by default for now.
+     */
+    defaultRelations: function defaultRelations(methodName, options) {
+        if (['edit', 'add'].indexOf(methodName) !== -1) {
+            options.withRelated = _.union(this.prototype.relationships, options.withRelated || []);
         }
 
         return options;
@@ -558,7 +646,10 @@ Post = ghostBookshelf.Model.extend({
 
             return ghostBookshelf.Model.edit.call(this, data, options)
                 .then((post) => {
-                    return this.findOne({status: 'all', id: options.id}, options)
+                    return this.findOne({
+                        status: 'all',
+                        id: options.id
+                    }, _.merge({transacting: options.transacting}, unfilteredOptions))
                         .then((found) => {
                             if (found) {
                                 // Pass along the updated attributes for checking status changes
@@ -590,7 +681,10 @@ Post = ghostBookshelf.Model.extend({
         const addPost = (() => {
             return ghostBookshelf.Model.add.call(this, data, options)
                 .then((post) => {
-                    return this.findOne({status: 'all', id: post.id}, options);
+                    return this.findOne({
+                        status: 'all',
+                        id: post.id
+                    }, _.merge({transacting: options.transacting}, unfilteredOptions));
                 });
         });
 
